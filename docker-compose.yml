@@ -1,0 +1,37 @@
+version: '3'
+
+services:
+  mongodb:
+    image: mongo:latest
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+  
+  api:
+    build: ./tjpr_api_diario
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URL=mongodb://mongodb:27017/
+      - MONGO_DB=diarios_db
+      - MONGO_COLLECTION=downloads
+    depends_on:
+      - mongodb
+  
+  scraper:
+    build: ./tjpr_scraper_diario
+    environment:
+      - API_URL=http://api:8000
+      - MONGO_URL=mongodb://mongodb:27017/
+      - MONGO_DB=diarios_db
+      - MONGO_COLLECTION=downloads
+      - DOWNLOAD_DIR=/app/Diarios
+    volumes:
+      - ./downloads:/app/Diarios
+    depends_on:
+      - api
+      - mongodb
+
+volumes:
+  mongodb_data:

@@ -1,0 +1,19 @@
+﻿# Diretórios de dados
+Diarios/
+arquivos/
+downloads/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Arquivos de ambiente
+.env
+.env.local
+
+# Logs
+*.log
+
+# Arquivos temporários
+*.tmp
