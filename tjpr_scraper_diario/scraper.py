@@ -3,6 +3,8 @@ import time
 import datetime
 import requests
 import glob
+import sys
+import traceback
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -12,116 +14,159 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 from pymongo import MongoClient
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class DJEDiarioScraper:
+    
     def __init__(self):
-        self.download_dir = os.path.join(os.getcwd(), "Diarios")  # Alterado para "arquivos"
+        self.download_dir = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_DIR", "Diarios"))
         self._setup_download_directory()
         self.driver = self._setup_driver()
-        self.original_window = None
-        self.wait = WebDriverWait(self.driver, 10)
-        self.api_url = "http://127.0.0.1:8000"
+        self.wait = WebDriverWait(self.driver, int(os.getenv("WAIT_TIMEOUT", "10")))
+        self.api_url = os.getenv("API_URL", "http://127.0.0.1:8000")
+        self.usar_dia_anterior = os.getenv("DIA_ANTERIOR", "false").lower() == "true"
         self.setup_mongodb()
 
     def setup_mongodb(self):
-        """Configura conexão com MongoDB"""
-        self.client = MongoClient("mongodb://localhost:27017/")
-        self.db = self.client["diarios_db"]
-        self.collection = self.db["downloads"]
+        try:
+            mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017/")
+            mongo_db = os.getenv("MONGO_DB", "diarios_db")
+            mongo_collection = os.getenv("MONGO_COLLECTION", "downloads")
+            
+            self.client = MongoClient(mongo_url)
+            self.db = self.client[mongo_db]
+            self.collection = self.db[mongo_collection]
+            print(f"✅ Conexão com MongoDB estabelecida: {mongo_url}")
+        except Exception as e:
+            print(f"❌ Erro ao conectar ao MongoDB: {str(e)}")
 
     def _setup_download_directory(self):
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
+            print(f"📁 Diretório de downloads criado: {self.download_dir}")
+        else:
+            print(f"📁 Usando diretório de downloads: {self.download_dir}")
 
     def _setup_driver(self):
         chrome_options = Options()
+        chrome_options.add_argument("--disable-application-cache")
         chrome_options.add_experimental_option("prefs", {
             "download.default_directory": self.download_dir,
             "download.prompt_for_download": False,
             "directory_upgrade": True,
             "safebrowsing.enabled": False,
-            "plugins.always_open_pdf_externally": True 
+            "plugins.always_open_pdf_externally": True,
+            "browser.download.manager.showWhenStarting": False,
+            "browser.helperApps.neverAsk.saveToDisk": "application/pdf,application/octet-stream"
         })
         service = Service(ChromeDriverManager().install())
         return webdriver.Chrome(service=service, options=chrome_options)
     
-    def _close_privacy_banner(self):
-        try:
-            politica_privacidade = self.wait.until(
-                EC.element_to_be_clickable((By.ID, 'politica-privacidade-tjpr'))
-            )
-            politica_privacidade.click()
-        except TimeoutException:
-            print("Banner de política de privacidade não encontrado ou não clicável.")
-
-    def _click_search_box(self):
-        try:
-            search_box = self.wait.until(
-                EC.element_to_be_clickable((By.ID, 'search_diario'))
-            )
-            search_box.click()
-        except TimeoutException:
-            print("Caixa de pesquisa não encontrada ou não clicável.")
-
-    def _switch_to_new_window(self):
-        # Aguardar nova janela abrir
-        self.wait.until(lambda d: len(d.window_handles) > 1)
-        
-        # Mudar para a nova janela
-        for window_handle in self.driver.window_handles:
-            if window_handle != self.original_window:
-                self.driver.switch_to.window(window_handle)
-                break
-
+    def _get_data_busca(self):
+        if self.usar_dia_anterior:
+            data = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d/%m/%Y")
+            print(f"🗓️ Usando data do dia anterior: {data}")
+        else:
+            data = datetime.datetime.now().strftime("%d/%m/%Y")
+            print(f"🗓️ Usando data atual: {data}")
+        return data
+    
     def _fill_search_form(self):
         try:
-            # Preencher data inicial
-            data_inicial = self.wait.until(
-                EC.presence_of_element_located((By.ID, 'dataPublicacaoInicio'))
-            )
-            data_inicial.clear()
-            data_inicial.send_keys(datetime.datetime.now().strftime("%d/%m/%Y"))
-
-            # Preencher data final
-            data_final = self.wait.until(
-                EC.presence_of_element_located((By.ID, 'dataPublicacaoFinal'))
-            )
-            data_final.clear()
-            data_final.send_keys(datetime.datetime.now().strftime("%d/%m/%Y"))
+            data_busca = self._get_data_busca()
             
-        except TimeoutException:
-            print("Erro ao preencher o formulário de pesquisa.")
+            try:
+                data_campo = self.wait.until(
+                    EC.presence_of_element_located((By.ID, 'dataVeiculacao'))
+                )
+                data_campo.clear()
+                data_campo.send_keys(data_busca)
+                print(f"✅ Campo de data preenchido: {data_busca}")
+                return True
+            except TimeoutException:
+               
+                campos_texto = self.driver.find_elements(By.XPATH, "//input[@type='text']")
+                if campos_texto:
+                    campo_data = campos_texto[1] if len(campos_texto) > 1 else campos_texto[0]
+                    campo_data.clear()
+                    campo_data.send_keys(data_busca)
+                    print(f"✅ Campo de texto alternativo preenchido: {data_busca}")
+                    return True
+                else:
+                    print("⚠️ Nenhum campo de texto encontrado para preencher a data")
+                    raise Exception("Campo de data não encontrado")
+                
+        except Exception as e:
+            print(f"❌ Erro ao preencher o formulário: {str(e)}")
+            return False
             
     def _search(self):
         try:
-            pesquisa = self.wait.until(
-                EC.element_to_be_clickable((By.ID, 'pesquisar'))
-            )
-            pesquisa.click()
-        except TimeoutException:
-            print("Botão de pesquisa não encontrado ou não clicável.")
+         
+            try:
+                pesquisa = self.wait.until(
+                    EC.element_to_be_clickable((By.ID, 'searchButton'))
+                )
+                pesquisa.click()
+                print("✅ Botão de pesquisa clicado")
+                return True
+            except TimeoutException:
+                # Fallback para outros tipos de botões
+                try:
+                    pesquisa = self.driver.find_element(By.XPATH, 
+                        "//input[@type='submit'] | //button[contains(text(), 'Pesquisar')]")
+                    pesquisa.click()
+                    print("✅ Botão de pesquisa alternativo clicado")
+                    return True
+                except:
+                    print("⚠️ Botão de pesquisa não encontrado")
+                    return False
+        except Exception as e:
+            print(f"❌ Erro ao clicar no botão de pesquisa: {str(e)}")
+            return False
             
     def _download_diario(self):
         try:
-            download = self.wait.until(
-                EC.element_to_be_clickable((By.CLASS_NAME, 'linkDownload'))
-            )
-            download.click()
-            print("Download iniciado...")
-        except TimeoutException:
-            print("Link de download não encontrado ou não clicável.")
+            time.sleep(3)
+            print("🔍 Analisando página de resultados...")
+            
+        
+            try:
+                baixar_link = self.driver.find_element(By.XPATH, "//a[@class='link' and text()='Baixar']")
+                print("🎯 Link 'Baixar' encontrado")
+                baixar_link.click()
+                print("✅ Download iniciado via link 'Baixar'")
+                return True
+            except Exception as e:
+                print("⚠️ Link 'Baixar' não encontrado, tentando alternativa")
+     
+            try:
+                download = self.driver.find_element(By.XPATH, 
+                    "//a[contains(text(), 'Baixar') or contains(text(), 'Download') or contains(@title, 'Baixar')]")
+                download.click()
+                print("✅ Download iniciado via link alternativo")
+                return True
+            except:
+                print("⚠️ Nenhum link de download encontrado")
+                return False
+            
+        except Exception as e:
+            print(f"❌ Erro ao tentar download: {str(e)}")
+            return False
             
     def _check_download_complete(self, timeout=60):
-        """Verifica se o download foi concluído"""
-        print("⏳ Aguardando download concluir...")
+        print(f"⏳ Aguardando download concluir (timeout: {timeout}s)...")
         inicio = time.time()
+        
         while time.time() - inicio < timeout:
-            # Verificar se existe algum arquivo .part (download em andamento)
+            # Verificar arquivos temporários
             part_files = glob.glob(os.path.join(self.download_dir, "*.part"))
             crdownload_files = glob.glob(os.path.join(self.download_dir, "*.crdownload"))
             
             if not part_files and not crdownload_files:
-                # Obter o arquivo PDF mais recente na pasta
+                # Verificar apenas arquivos PDF
                 pdf_files = glob.glob(os.path.join(self.download_dir, "*.pdf"))
                 if pdf_files:
                     # Ordenar por data de modificação (mais recente primeiro)
@@ -130,17 +175,20 @@ class DJEDiarioScraper:
             
             time.sleep(1)
         
-        return None  # Timeout - download não concluído
+        print("❌ Timeout - download não foi concluído")
+        return None
 
     def _get_file_info(self, filepath):
-        """Obtém informações do arquivo baixado"""
         if not filepath or not os.path.exists(filepath):
+            print(f"❌ Arquivo não encontrado: {filepath}")
             return None
+        
+        data_busca = self._get_data_busca()
         
         info = {
             "nome_arquivo": os.path.basename(filepath),
             "caminho_arquivo": filepath,
-            "data_diario": datetime.datetime.now().strftime("%d/%m/%Y"),
+            "data_diario": data_busca,
             "data_download": datetime.datetime.now(),
             "status_leitura": False,
             "tamanho": os.path.getsize(filepath)
@@ -148,7 +196,6 @@ class DJEDiarioScraper:
         return info
 
     def _registrar_download_mongodb(self, file_info):
-        """Registra o download diretamente no MongoDB"""
         try:
             resultado = self.collection.insert_one(file_info)
             print(f"✅ Download registrado no MongoDB: {file_info['nome_arquivo']}")
@@ -158,16 +205,12 @@ class DJEDiarioScraper:
             return None
 
     def _registrar_download_api(self, file_info):
-        """Registra o download via API"""
         try:
-            # Converter formato de data para o que a API espera (DD-MM-YYYY)
-            # Substituir barras por hífens na data
             data_diario = file_info["data_diario"].replace("/", "-")
             
-            # Criar payload no formato que a API espera
             payload = {
                 "data_diario": data_diario,
-                "tribunal": "TJPR",
+                "tribunal": os.getenv("TRIBUNAL", "TJPR"),
                 "cadernos": [
                     {
                         "caderno": file_info["nome_arquivo"],
@@ -177,7 +220,12 @@ class DJEDiarioScraper:
                 ]
             }
             
-            response = requests.post(f"{self.api_url}/salvar/", json=payload)
+            endpoint = os.getenv("API_ENDPOINT", "salvar")
+            url = f"{self.api_url}/{endpoint}/"
+            
+            print(f"📤 Enviando dados para API: {url}")
+            response = requests.post(url, json=payload)
+            
             if response.status_code == 200:
                 print(f"✅ Download registrado via API: {file_info['nome_arquivo']}")
                 return response.json()
@@ -190,53 +238,62 @@ class DJEDiarioScraper:
 
     def run(self):
         try:
-            # Acessar o site
-            self.driver.get("https://www.tjpr.jus.br/")
+            print(f"🔄 Iniciando scraper de diários TJPR...")
+            
+            site_url = "https://portal.tjpr.jus.br/e-dj/publico/diario/pesquisar/filtro.do"
+            self.driver.get(site_url)
+            print(f"🌐 Acessando página de pesquisa: {site_url}")
             time.sleep(5)
             
-            # Salvar janela original
-            self.original_window = self.driver.current_window_handle
+            if not self._fill_search_form():
+                print("❌ Falha ao preencher formulário de pesquisa")
+                return False
             
-            # Executar passos do scraping
-            self._close_privacy_banner()
-            self._click_search_box()
-            self._switch_to_new_window()
-            self._fill_search_form()
-            self._search()     
-            self._download_diario()
+            if not self._search():
+                print("❌ Falha ao executar pesquisa")
+                return False
             
-            # Aguardar tempo adicional para processamento
             time.sleep(5)
             
-            # NOVO: Verificar conclusão do download e registrar
-            downloaded_file = self._check_download_complete()
+            if not self._download_diario():
+                print("❌ Não foi possível iniciar o download")
+                return False
+            
+            downloaded_file = self._check_download_complete(int(os.getenv("DOWNLOAD_TIMEOUT", "60")))
             
             if downloaded_file:
                 print(f"✅ Download concluído: {downloaded_file}")
-                # Obter informações do arquivo
                 file_info = self._get_file_info(downloaded_file)
-                
-                # Registrar via MongoDB diretamente
                 self._registrar_download_mongodb(file_info)
-                
-                # Tentar registrar via API também
                 self._registrar_download_api(file_info)
+                return True
             else:
                 print("❌ Download não foi concluído")
+                return False
 
         except Exception as e:
-            print(f"Erro durante a execução: {str(e)}")
-            self.close()
+            print(f"❌ Erro durante a execução: {str(e)}")
+            traceback.print_exc()
+            return False
 
     def close(self):
-        if self.driver:
+        if hasattr(self, 'driver'):
             self.driver.quit()
+            print("🔒 Driver do navegador fechado")
         if hasattr(self, 'client'):
             self.client.close()
+            print("🔒 Conexão com MongoDB fechada")
+        print("👋 Scraper finalizado")
 
 if __name__ == "__main__":
     scraper = DJEDiarioScraper()
     try:
-        scraper.run()
+        resultado = scraper.run()
+        if resultado:
+            print("✅ Scraper concluído com sucesso!")
+            sys.exit(0)
+        else:
+            print("❌ Scraper falhou na execução!")
+            sys.exit(1)
     finally:
         scraper.close()
